@@ -1,0 +1,9 @@
+[Unit]
+Description = VMTouch Jellyfin Media Watchiner
+After = network-online.target
+
+[Service]
+Type = simple
+Environment = PYTHONUNBUFFERED="true"
+ExecStart = /usr/local/sbin/vmtouch-jellyfin-media
+Restart = on-failure

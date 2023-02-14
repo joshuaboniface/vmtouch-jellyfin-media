@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+
+import sys
+import re
+import signal
+import subprocess
+import threading
+
+# Tune this based on your RAM amount
+MAX_FILESIZE = '16G'
+
+# Flag to determine what time of touch to use
+#   "-t": Normal touch, pages may be evicted
+#   "-l"/"-L": Lock touch, pages may not be evicted until manually freed
+TOUCH_TYPE = "-l"
+
+logwatchp = None
+vmtouchp = None
+
+def cleanup(*args):
+    if logwatchp is not None:
+        print(f"Terminating logwatch process")
+        logwatchp.kill()
+        if TOUCH_TYPE != "-t" and vmtouchp is not None:
+            print(f"Terminating current vmtouch process")
+            vmtouchp.kill()
+    exit(0)
+
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
+
+file_list = set()
+
+print(f"Watching Jellyfin service logs...")
+logwatchp = subprocess.Popen(['journalctl', '-u', 'jellyfin', '-n', '0', '-f'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def run_vmtouch(filename):
+    global vmtouchp
+    print("Reading file with vmtouch", end='')
+    if TOUCH_TYPE != "-t":
+        print(" (blocking)... ", end='')
+    else:
+        print("...")
+    vmtouch_cmd = ['vmtouch', '-m', MAX_FILESIZE, TOUCH_TYPE, filename]
+    vmtouchp = subprocess.Popen(vmtouch_cmd, stdout=sys.stdout, stderr=subprocess.STDOUT, universal_newlines=True)
+    if TOUCH_TYPE != "-t":
+        print(f"running as PID {vmtouchp.pid}.")
+        vmtouchp.wait()
+    else:
+        vmtouchp.communicate()
+    vmtouchp = None
+
+def purge_vmtouch(filename):
+    global vmtouchp
+    print("Purging file from resident memory with vmtouch...")
+    vmtouch_cmd = ['vmtouch', '-e', filename]
+    vmtouchp = subprocess.Popen(vmtouch_cmd, stdout=sys.stdout, stderr=subprocess.STDOUT, universal_newlines=True)
+    vmtouchp.communicate()
+    vmtouchp = None
+
+for _line in iter(logwatchp.stdout.readline, ''):
+    line = _line.decode('utf-8').strip()
+    if re.search(r'StreamBuilder.Build(.*)Item', line):
+        filename = re.search(r'Path=(.*), Audio', line).group(1)
+        print(f"Jellyfin opened media file '{filename}'")
+        file_list.add(filename)
+        threading.Thread(target=run_vmtouch, args=(filename,)).start()
+
+    if re.search(r'Playback stopped', line):
+        playback_title = re.search(r'playing (.*)\. Stopped at', line).group(1)
+        for filename in file_list.copy():
+            if playback_title in filename:
+                print(f"Jellyfin stopped playback of media file '{filename}'")
+                if TOUCH_TYPE != "-t":
+                    vmtouchp.kill()
+                file_list.remove(filename)
+                threading.Thread(target=purge_vmtouch, args=(filename,)).start()
